@@ -16,6 +16,7 @@ package certmagic
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mholt/acmez/acme"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ocsp"
 )
@@ -56,6 +58,15 @@ type Certificate struct {
 
 	// The unique string identifying the issuer of this certificate.
 	issuerKey string
+
+	// Base64url-encoded DER ASN.1 CertID sequence; used for
+	// ACME Renewal Information (ARI) and, technically, OCSP,
+	// though we don't use this for OCSP because the ocsp
+	// package doesn't let us use our cached value as input.
+	certIDSeq string
+
+	// Used if managing with an ARI-enabled ACME server.
+	ari acme.RenewalInfo
 }
 
 // Empty returns true if the certificate struct is not filled out; at
@@ -67,6 +78,7 @@ func (cert Certificate) Empty() bool {
 // NeedsRenewal returns true if the certificate is
 // expiring soon (according to cfg) or has expired.
 func (cert Certificate) NeedsRenewal(cfg *Config) bool {
+	// TODO: ARI...
 	return currentlyInRenewalWindow(cert.Leaf.NotBefore, expiresAt(cert.Leaf), cfg.RenewalWindowRatio)
 }
 
@@ -145,9 +157,29 @@ func (cfg *Config) loadManagedCertificate(ctx context.Context, domain string) (C
 	if err != nil {
 		return cert, err
 	}
+	if cfg.anyACMEIssuers() {
+		var certChain []*x509.Certificate
+		certChain, err = parseCertsFromPEMBundle(certRes.CertificatePEM)
+		if err != nil {
+			return Certificate{}, err
+		}
+		cert.certIDSeq, err = acme.CertIDSequence(ctx, certChain, crypto.SHA256, nil)
+		if err != nil && cfg.Logger != nil {
+			cfg.Logger.Error("setting CertID for ARI", zap.Error(err))
+		}
+	}
 	cert.managed = true
 	cert.issuerKey = certRes.issuerKey
 	return cert, nil
+}
+
+func (cfg *Config) anyACMEIssuers() bool {
+	for _, iss := range cfg.Issuers {
+		if _, ok := iss.(*ACMEIssuer); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // CacheUnmanagedCertificatePEMFile loads a certificate for host using certFile
@@ -176,7 +208,7 @@ func (cfg *Config) CacheUnmanagedTLSCertificate(ctx context.Context, tlsCert tls
 	if err != nil {
 		return err
 	}
-	err = stapleOCSP(ctx, cfg.OCSP, cfg.Storage, &cert, nil)
+	err = stapleOCSP(ctx, cfg.OCSP, cfg.Storage, &cert, nil, nil)
 	if err != nil {
 		cfg.Logger.Warn("stapling OCSP", zap.Error(err))
 	}
@@ -224,7 +256,7 @@ func (cfg Config) makeCertificateWithOCSP(ctx context.Context, certPEMBlock, key
 	if err != nil {
 		return cert, err
 	}
-	err = stapleOCSP(ctx, cfg.OCSP, cfg.Storage, &cert, certPEMBlock)
+	err = stapleOCSP(ctx, cfg.OCSP, cfg.Storage, &cert, certPEMBlock, nil)
 	if err != nil {
 		cfg.Logger.Warn("stapling OCSP", zap.Error(err), zap.Strings("identifiers", cert.Names))
 	}

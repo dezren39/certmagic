@@ -39,7 +39,7 @@ import (
 //
 // Errors here are not necessarily fatal, it could just be that the
 // certificate doesn't have an issuer URL.
-func stapleOCSP(ctx context.Context, ocspConfig OCSPConfig, storage Storage, cert *Certificate, pemBundle []byte) error {
+func stapleOCSP(ctx context.Context, ocspConfig OCSPConfig, storage Storage, cert *Certificate, pemBundle []byte, certChain []*x509.Certificate) error {
 	if ocspConfig.DisableStapling {
 		return nil
 	}
@@ -87,7 +87,12 @@ func stapleOCSP(ctx context.Context, ocspConfig OCSPConfig, storage Storage, cer
 	// If we couldn't get a fresh staple by reading the cache,
 	// then we need to request it from the OCSP responder
 	if ocspResp == nil || len(ocspBytes) == 0 {
-		ocspBytes, ocspResp, ocspErr = getOCSPForCert(ocspConfig, pemBundle)
+		if len(certChain) == 0 {
+			if certChain, err = parseCertsFromPEMBundle(pemBundle); err != nil {
+				return err
+			}
+		}
+		ocspBytes, ocspResp, ocspErr = getOCSPForCert(ocspConfig, certChain)
 		if ocspErr != nil {
 			// An error here is not a problem because a certificate may simply
 			// not contain a link to an OCSP server. But we should log it anyway.
@@ -134,20 +139,15 @@ func stapleOCSP(ctx context.Context, ocspConfig OCSPConfig, storage Storage, cer
 // values are nil, the OCSP status may be assumed OCSPUnknown.
 //
 // Borrowed from xenolf.
-func getOCSPForCert(ocspConfig OCSPConfig, bundle []byte) ([]byte, *ocsp.Response, error) {
+func getOCSPForCert(ocspConfig OCSPConfig, certChain []*x509.Certificate) ([]byte, *ocsp.Response, error) {
 	// TODO: Perhaps this should be synchronized too, with a Locker?
-
-	certificates, err := parseCertsFromPEMBundle(bundle)
-	if err != nil {
-		return nil, nil, err
-	}
 
 	// We expect the certificate slice to be ordered downwards the chain.
 	// SRV CRT -> CA. We need to pull the leaf and issuer certs out of it,
 	// which should always be the first two certificates. If there's no
 	// OCSP server listed in the leaf cert, there's nothing to do. And if
 	// we have only one certificate so far, we need to get the issuer cert.
-	issuedCert := certificates[0]
+	issuedCert := certChain[0]
 	if len(issuedCert.OCSPServer) == 0 {
 		return nil, nil, fmt.Errorf("no OCSP server specified in certificate")
 	}
@@ -163,7 +163,7 @@ func getOCSPForCert(ocspConfig OCSPConfig, bundle []byte) ([]byte, *ocsp.Respons
 		return nil, nil, fmt.Errorf("override disables querying OCSP responder: %v", issuedCert.OCSPServer[0])
 	}
 
-	if len(certificates) == 1 {
+	if len(certChain) == 1 {
 		if len(issuedCert.IssuingCertificateURL) == 0 {
 			return nil, nil, fmt.Errorf("no URL to issuing certificate")
 		}
@@ -186,10 +186,10 @@ func getOCSPForCert(ocspConfig OCSPConfig, bundle []byte) ([]byte, *ocsp.Respons
 
 		// insert it into the slice on position 0;
 		// we want it ordered right SRV CRT -> CA
-		certificates = append(certificates, issuerCert)
+		certChain = append(certChain, issuerCert)
 	}
 
-	issuerCert := certificates[1]
+	issuerCert := certChain[1]
 
 	ocspReq, err := ocsp.CreateRequest(issuedCert, issuerCert, nil)
 	if err != nil {
